@@ -1,4 +1,4 @@
-# jornal2.py — Jornal Crucial (Felipe Tacconi)
+# jornal2.py — Jornal (Felipe Tacconi)
 # Coleta RSS por tema (rápido) + cache por feed (TTL)
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ CACHE_TTL = int(__import__("os").environ.get("JC_CACHE_TTL", "180"))  # 3 min
 TIMEZONE = __import__("os").environ.get("JC_TIMEZONE", "America/Sao_Paulo")
 
 DEFAULT_HEADERS = {
-    "User-Agent": "JornalCrucial/1.0 (+https://jornal-j5jf.onrender.com)",
+    "User-Agent": "Jornal/1.0 (+https://jornal-j5jf.onrender.com)",
     "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7",
     "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
     "Cache-Control": "no-cache",
@@ -89,7 +89,7 @@ FEEDS_BY_TEMA: Dict[str, List[str]] = {
         "https://g1.globo.com/dynamo/politica/rss2.xml",
         "https://feeds.folha.uol.com.br/poder/rss091.xml",
     ],
-    "🌍 Geopolítica": [
+    "🌍 Economia": [
         "https://g1.globo.com/dynamo/mundo/rss2.xml",
         "https://feeds.bbci.co.uk/portuguese/rss.xml",
     ],
@@ -103,11 +103,11 @@ FEEDS_BY_TEMA: Dict[str, List[str]] = {
 }
 
 LIMITES_PADRAO: Dict[str, int] = {
-    "⚽ Esporte": 8,
-    "🎭 Cultura": 8,
-    "🏛️ Política Brasil": 8,
-    "🌍 Geopolítica": 8,
-    "📰 Últimas": 20,
+    "⚽ Esporte": 9,
+    "🎭 Cultura": 9,
+    "🏛️ Política Brasil": 9,
+    "🌍 Economia": 9,
+    "📰 Últimas": 100,
 }
 
 

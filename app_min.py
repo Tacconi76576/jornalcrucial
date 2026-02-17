@@ -6,6 +6,8 @@
 # - Corrige horário "no futuro" (usa calendar.timegm para struct_time UTC do feedparser)
 # - Tema "📰 Últimas": 100 itens, lista 1 coluna, com HORÁRIO antes da manchete (igual aos outros temas)
 # - Outros temas continuam no layout normal (com hora + título + fonte + resumo)
+# - Corrige NameError: display_label não definido
+# - Renomeia/expõe "🌍 Economia" (se existir no jornal2.py)
 
 from __future__ import annotations
 
@@ -17,7 +19,6 @@ import os
 import random
 import re
 import threading
-import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -28,7 +29,6 @@ from flask import (
     render_template_string,
     request,
     session,
-    url_for,
 )
 
 from jornal2 import FEEDS_BY_TEMA, LIMITES_PADRAO, coletar_noticias_por_tema
@@ -226,8 +226,14 @@ TEMA_SLUGS = {slugify_tema(t): t for t in TEMAS}
 
 
 def display_label(tema: str) -> str:
+    """
+    Rótulo exibido no menu/título.
+    Se você trocou o tema no jornal2.py para "🌍 Economia", ele aparece como economia aqui.
+    """
     mapping = {
-        "🌍 Geopolítica": "👪 Família",
+        "🌍 Economia": "🌍 Economia",
+        # se ainda existir geopolítica em algum lugar, você pode mapear:
+        "🌍 Geopolítica": "🌍 Economia",
     }
     return mapping.get(tema, tema)
 
@@ -255,9 +261,16 @@ IMAGENS_POR_TEMA: Dict[str, List[str]] = {
         "img/politica/politica3.jpg",
         "img/politica/politica4.jpg",
     ],
+    # ✅ aqui: economia
+    "🌍 Economia": [
+        "img/economia/economia1.jpg",
+        "img/economia/economia2.jpg",
+        "img/economia/economia3.jpg",
+    ],
+    # caso ainda chame geopolítica em algum lugar:
     "🌍 Geopolítica": [
-        "img/familia/familia1.jpg",
-        "img/familia/familia2.jpg",
+        "img/economia/economia1.jpg",
+        "img/economia/economia2.jpg",
     ],
     "⚽ Esporte": [
         "img/esporte/esporte1.jpg",
@@ -546,7 +559,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     <div class="paper">
       <div class="masthead">
         <div class="kicker">Edição local • papel & tinta • sem login</div>
-        <h1>Jornal</h1>
+        <h1>Jornal Crucial</h1>
         <div class="meta">
           <div><span class="badge">Manchetes por tema</span></div>
           <div class="when">
