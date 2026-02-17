@@ -6,8 +6,7 @@
 # - Corrige horário "no futuro" (usa calendar.timegm para struct_time UTC do feedparser)
 # - Tema "📰 Últimas": 100 itens, lista 1 coluna, com HORÁRIO antes da manchete (igual aos outros temas)
 # - Outros temas continuam no layout normal (com hora + título + fonte + resumo)
-# - Corrige NameError: display_label não definido
-# - Renomeia/expõe "🌍 Economia" (se existir no jornal2.py)
+# - Sem "Geopolítica" em nenhum lugar: fica somente "🌍 Economia"
 
 from __future__ import annotations
 
@@ -221,21 +220,13 @@ def slugify_tema(tema: str) -> str:
     return base or "tema"
 
 
+def display_label(tema: str) -> str:
+    """Rótulo exibido no menu/título (sem mapeamento de geopolítica)."""
+    return tema
+
+
 TEMAS = list(FEEDS_BY_TEMA.keys())
 TEMA_SLUGS = {slugify_tema(t): t for t in TEMAS}
-
-
-def display_label(tema: str) -> str:
-    """
-    Rótulo exibido no menu/título.
-    Se você trocou o tema no jornal2.py para "🌍 Economia", ele aparece como economia aqui.
-    """
-    mapping = {
-        "🌍 Economia": "🌍 Economia",
-        # se ainda existir geopolítica em algum lugar, você pode mapear:
-        "🌍 Geopolítica": "🌍 Economia",
-    }
-    return mapping.get(tema, tema)
 
 
 def build_menu():
@@ -261,16 +252,10 @@ IMAGENS_POR_TEMA: Dict[str, List[str]] = {
         "img/politica/politica3.jpg",
         "img/politica/politica4.jpg",
     ],
-    # ✅ aqui: economia
     "🌍 Economia": [
-        "img/economia/economia1.jpg",
-        "img/economia/economia2.jpg",
+        "img/economia/economia1.png",
+        "img/economia/economia2.png",
         "img/economia/economia3.jpg",
-    ],
-    # caso ainda chame geopolítica em algum lugar:
-    "🌍 Geopolítica": [
-        "img/economia/economia1.jpg",
-        "img/economia/economia2.jpg",
     ],
     "⚽ Esporte": [
         "img/esporte/esporte1.jpg",
