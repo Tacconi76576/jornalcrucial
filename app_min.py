@@ -1,25 +1,51 @@
-# app_min.py — Jornal Crucial (somente jornal)
+#!/usr/bin/env python3
+# app_min.py — Jornal Crucial (versão melhorada)
 # Cache forte (JSON em disco + atualização em background) para Render ficar rápido.
+#
+# ✅ Nesta versão:
+# - Corrige horário "no futuro" (usa calendar.timegm para struct_time UTC do feedparser)
+# - Tema "📰 Últimas": 100 itens, lista 1 coluna, com HORÁRIO antes da manchete (igual aos outros temas)
+# - Outros temas continuam no layout normal (com hora + título + fonte + resumo)
 
 from __future__ import annotations
 
+import calendar
 import html as _html
 import json
+import logging
 import os
 import random
 import re
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-from flask import Flask, redirect, render_template_string, request, session, url_for
+from flask import (
+    Flask,
+    abort,
+    render_template_string,
+    request,
+    session,
+    url_for,
+)
 
 from jornal2 import FEEDS_BY_TEMA, LIMITES_PADRAO, coletar_noticias_por_tema
 
+# =========================================================
+# Configuração inicial
+# =========================================================
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "jornal-crucial-chave-local-1234567890")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger("jornal-crucial")
+
+TZ_BR = ZoneInfo("America/Sao_Paulo")
 
 # =========================================================
 # Compressão gzip + headers de performance
@@ -30,7 +56,7 @@ import io as _io
 
 @app.after_request
 def compress_response(response):
-    # Só comprime text/* e application/json, só se cliente aceitar gzip
+    """Comprime respostas textuais se o cliente aceitar gzip e o payload for grande."""
     accept = request.headers.get("Accept-Encoding", "")
     if "gzip" not in accept:
         return response
@@ -40,7 +66,7 @@ def compress_response(response):
     if response.direct_passthrough:
         return response
     data = response.get_data()
-    if len(data) < 500:  # não vale comprimir payloads pequenos
+    if len(data) < 500:
         return response
     buf = _io.BytesIO()
     with _gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=6) as gz:
@@ -50,6 +76,7 @@ def compress_response(response):
     response.headers["Content-Length"] = len(response.get_data())
     response.headers["Vary"] = "Accept-Encoding"
     return response
+
 
 # =========================================================
 # Sanitização rápida
@@ -63,12 +90,21 @@ RE_P_CLOSE = re.compile(r"</p\s*>", flags=re.IGNORECASE)
 RE_WS = re.compile(r"\s+")
 
 BLACKLIST = (
-    "Leia mais", "Veja mais", "VÍDEOS:", "Veja os vídeos", "Siga o canal", "Clique aqui",
-    "Participe do canal", "Receba as notícias", "The post", "appeared first on",
-    "Leia a íntegra", "Leia a nota", "Assista", "AO VIVO",
+    "Leia mais",
+    "Veja mais",
+    "VÍDEOS:",
+    "Veja os vídeos",
+    "Siga o canal",
+    "Clique aqui",
+    "Participe do canal",
+    "Receba as notícias",
+    "The post",
+    "appeared first on",
+    "Leia a íntegra",
+    "Leia a nota",
+    "Assista",
+    "AO VIVO",
 )
-
-TZ_BR = ZoneInfo("America/Sao_Paulo")
 
 
 def strip_html(text: Any) -> str:
@@ -107,42 +143,40 @@ def _get(entry: Any, *keys: str, default: str = "") -> Any:
     return default
 
 
+# =========================================================
+# Horários (CORRIGIDO: struct_time do feedparser é UTC)
+# =========================================================
 def entry_ts(e: Any) -> float:
+    """Timestamp correto: usa calendar.timegm (UTC)."""
     try:
         t = e.get("published_parsed") or e.get("updated_parsed")
     except Exception:
         t = None
     try:
-        return time.mktime(t) if t else 0.0
+        return float(calendar.timegm(t)) if t else 0.0
     except Exception:
         return 0.0
 
 
-# =========================================================
-# NOVO: formata hora da notícia no fuso de Brasília
-# =========================================================
 def formatar_hora_noticia(entry: Any) -> str:
     """
-    Lê published_parsed (struct_time UTC do feedparser) e converte para
-    horário de Brasília. Retorna "HH:MM" se for hoje, "DD/MM HH:MM" se for
-    outro dia, ou "" se não houver dado.
-
-    IMPORTANTE: usa calendar.timegm() (não time.mktime()) porque o feedparser
-    devolve published_parsed em UTC — time.mktime() interpretaria como hora
-    local do servidor e causaria adiantamento de 3h no Render (servidor em UTC).
+    Converte o horário UTC da notícia para o fuso de Brasília.
+    Retorna "HH:MM" se for hoje, "DD/MM HH:MM" caso contrário.
     """
     try:
-        import calendar
         t = entry.get("published_parsed") or entry.get("updated_parsed")
         if not t:
             return ""
-        ts = calendar.timegm(t)  # struct_time UTC → timestamp correto
-        dt_local = datetime.fromtimestamp(ts, tz=TZ_BR)
+        ts = calendar.timegm(t)  # ✅ UTC correto
+        dt_utc = datetime.fromtimestamp(ts, tz=ZoneInfo("UTC"))
+        dt_local = dt_utc.astimezone(TZ_BR)
+
         agora_local = datetime.now(tz=TZ_BR)
         if dt_local.date() == agora_local.date():
             return dt_local.strftime("%H:%M")
         return dt_local.strftime("%d/%m %H:%M")
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Erro ao formatar hora da notícia: {e}")
         return ""
 
 
@@ -158,7 +192,7 @@ def normalize_entry(entry: Any) -> Dict[str, Any]:
         "fonte": strip_html(fonte),
         "resumo": summarize(resumo_raw, 320),
         "ts": float(entry_ts(entry)),
-        "hora": formatar_hora_noticia(entry),  # ← NOVO campo
+        "hora": formatar_hora_noticia(entry),
     }
 
 
@@ -192,7 +226,10 @@ TEMA_SLUGS = {slugify_tema(t): t for t in TEMAS}
 
 
 def display_label(tema: str) -> str:
-    return "👪 Família" if tema == "🌍 Geopolítica" else tema
+    mapping = {
+        "🌍 Geopolítica": "👪 Família",
+    }
+    return mapping.get(tema, tema)
 
 
 def build_menu():
@@ -239,14 +276,15 @@ IMAGENS_POR_TEMA: Dict[str, List[str]] = {
         "img/tudo/tudo4.jpg",
     ],
 }
+IMAGEM_FALLBACK = "img/fallback.jpg"
 
 
 def escolher_imagem_sem_repetir(tema_label: Optional[str]) -> Optional[str]:
     if not tema_label:
         return None
-    imagens = IMAGENS_POR_TEMA.get(tema_label) or []
+    imagens = IMAGENS_POR_TEMA.get(tema_label)
     if not imagens:
-        return None
+        return IMAGEM_FALLBACK
 
     key = f"last_img::{tema_label}"
     last = session.get(key)
@@ -262,22 +300,35 @@ def escolher_imagem_sem_repetir(tema_label: Optional[str]) -> Optional[str]:
 
 
 # =========================================================
-# Lua
+# Fase da Lua (cálculo em UTC)
 # =========================================================
-def fase_da_lua(dt: datetime) -> str:
-    ref = datetime(2000, 1, 6, 18, 14)
+def fase_da_lua(dt: Optional[datetime] = None) -> str:
+    if dt is None:
+        dt = datetime.now(timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+
+    ref = datetime(2000, 1, 6, 18, 14, tzinfo=timezone.utc)
     days = (dt - ref).total_seconds() / 86400.0
     synodic = 29.53058867
     age = days % synodic
 
-    if age < 1.84566: return "🌑 Lua Nova"
-    if age < 5.53699: return "🌒 Crescente"
-    if age < 9.22831: return "🌓 Quarto Crescente"
-    if age < 12.91963: return "🌔 Gibosa Crescente"
-    if age < 16.61096: return "🌕 Lua Cheia"
-    if age < 20.30228: return "🌖 Gibosa Minguante"
-    if age < 23.99361: return "🌗 Quarto Minguante"
-    if age < 27.68493: return "🌘 Minguante"
+    if age < 1.84566:
+        return "🌑 Lua Nova"
+    if age < 5.53699:
+        return "🌒 Crescente"
+    if age < 9.22831:
+        return "🌓 Quarto Crescente"
+    if age < 12.91963:
+        return "🌔 Gibosa Crescente"
+    if age < 16.61096:
+        return "🌕 Lua Cheia"
+    if age < 20.30228:
+        return "🌖 Gibosa Minguante"
+    if age < 23.99361:
+        return "🌗 Quarto Minguante"
+    if age < 27.68493:
+        return "🌘 Minguante"
     return "🌑 Lua Nova"
 
 
@@ -285,9 +336,8 @@ def fase_da_lua(dt: datetime) -> str:
 # Cache em JSON
 # =========================================================
 CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))
-
 BASE_DIR = os.path.dirname(__file__)
-CACHE_DIR = os.path.join(BASE_DIR, "cache")
+CACHE_DIR = os.getenv("CACHE_DIR", os.path.join(BASE_DIR, "cache"))
 CACHE_FILE = os.path.join(CACHE_DIR, "feeds_cache.json")
 
 _CACHE_LOCK = threading.Lock()
@@ -300,7 +350,7 @@ def _ensure_cache_dir():
 
 
 def _now_iso() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="seconds") + "Z"
 
 
 def _read_cache_file() -> Dict[str, Any]:
@@ -310,30 +360,49 @@ def _read_cache_file() -> Dict[str, Any]:
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except Exception as e:
+        logger.error(f"Erro ao ler cache: {e}")
         return {"updated_at": None, "buckets": {}}
 
 
 def _write_cache_file(data: Dict[str, Any]) -> None:
     _ensure_cache_dir()
     tmp = CACHE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, CACHE_FILE)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CACHE_FILE)
+        logger.info("Cache atualizado com sucesso.")
+    except Exception as e:
+        logger.error(f"Erro ao escrever cache: {e}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def _cache_age_seconds(updated_at: Optional[str]) -> float:
     if not updated_at:
         return 1e18
     try:
+        if updated_at.endswith("Z"):
+            updated_at = updated_at[:-1] + "+00:00"
         last = datetime.fromisoformat(updated_at)
-        return (datetime.now() - last).total_seconds()
-    except Exception:
+        now = datetime.now(timezone.utc)
+        return (now - last).total_seconds()
+    except Exception as e:
+        logger.warning(f"Erro ao calcular idade do cache: {e}")
         return 1e18
 
 
 def _build_cache_from_feeds() -> Dict[str, Any]:
-    buckets_raw, _flat = coletar_noticias_por_tema(LIMITES_PADRAO)
+    logger.info("Iniciando construção do cache a partir dos feeds...")
+
+    limites = dict(LIMITES_PADRAO or {})
+    if "📰 Últimas" in FEEDS_BY_TEMA:
+        limites["📰 Últimas"] = max(int(limites.get("📰 Últimas", 0) or 0), 100)
+
+    buckets_raw, _flat = coletar_noticias_por_tema(limites)
 
     buckets_norm: Dict[str, List[Dict[str, Any]]] = {}
     for tema, entries in (buckets_raw or {}).items():
@@ -341,13 +410,14 @@ def _build_cache_from_feeds() -> Dict[str, Any]:
             entries = list(entries or [])
         except Exception:
             entries = []
-        entries.sort(key=entry_ts, reverse=True)
-        buckets_norm[tema] = normalize_list(entries, limit=120)
 
-    return {
-        "updated_at": _now_iso(),
-        "buckets": buckets_norm,
-    }
+        entries.sort(key=entry_ts, reverse=True)
+
+        keep = 140 if tema == "📰 Últimas" else 120
+        buckets_norm[tema] = normalize_list(entries, limit=keep)
+
+    logger.info("Cache construído com sucesso.")
+    return {"updated_at": _now_iso(), "buckets": buckets_norm}
 
 
 def refresh_cache_sync() -> None:
@@ -412,7 +482,6 @@ def get_section_cached(tema_label: Optional[str], limit: int) -> Tuple[str, List
         titulo = display_label(tema_label)
         noticias = entries[:limit]
 
-    # NÃO remove mais o campo 'ts' — só remove se quiser; 'hora' precisa ficar
     for n in noticias:
         n.pop("ts", None)
 
@@ -420,9 +489,9 @@ def get_section_cached(tema_label: Optional[str], limit: int) -> Tuple[str, List
 
 
 # =========================================================
-# HTML
+# Template HTML
 # =========================================================
-HTML = r"""<!doctype html>
+HTML_TEMPLATE = r"""<!doctype html>
 <html lang="pt-br">
 <head>
   <meta charset="utf-8"/>
@@ -463,6 +532,13 @@ HTML = r"""<!doctype html>
     .teaser{ margin:0; font-size:12.5px; color:#2a241c; line-height:1.45; }
     .readmore{ display:inline-block; margin-top:8px; font-size:12px; color:var(--muted); text-decoration:none; border-bottom:1px dotted rgba(30,27,22,.35); }
     .readmore:hover{ color:var(--ink); border-bottom-color:rgba(30,27,22,.85); }
+
+    /* Últimas: 1 coluna, com o MESMO horário (pub-time) antes da manchete */
+    .ultimas-list{ list-style:none; padding:0; margin:0; }
+    .ultimas-item{ break-inside:avoid; margin:0 0 10px 0; padding:0 0 10px 0; border-bottom:1px dashed var(--rule); }
+    .ultimas-item:last-child{ border-bottom:none; padding-bottom:0; margin-bottom:0; }
+    .ultimas-a{ color:inherit; text-decoration:none; font-weight:700; line-height:1.25; display:block; }
+    .ultimas-a:hover{ text-decoration:underline; }
   </style>
 </head>
 <body>
@@ -470,7 +546,7 @@ HTML = r"""<!doctype html>
     <div class="paper">
       <div class="masthead">
         <div class="kicker">Edição local • papel & tinta • sem login</div>
-        <h1>Jornal Crucial</h1>
+        <h1>Jornal</h1>
         <div class="meta">
           <div><span class="badge">Manchetes por tema</span></div>
           <div class="when">
@@ -497,34 +573,51 @@ HTML = r"""<!doctype html>
         {% endif %}
 
         {% if noticias %}
-          <div class="columns">
-            {% for n in noticias %}
-              <div class="item">
-                {% if n.hora %}
-                  <span class="pub-time">{{ n.hora }}</span>
-                {% endif %}
-                <div class="headline">
+          {% if so_manchetes %}
+            <ul class="ultimas-list">
+              {% for n in noticias %}
+                <li class="ultimas-item">
+                  {% if n.hora %}
+                    <span class="pub-time">{{ n.hora }}</span>
+                  {% endif %}
                   {% if n.link %}
-                    <a href="{{ n.link }}" target="_blank" rel="noopener">{{ n.titulo }}</a>
+                    <a class="ultimas-a" href="{{ n.link }}" target="_blank" rel="noopener">{{ n.titulo }}</a>
                   {% else %}
-                    {{ n.titulo }}
+                    <span class="ultimas-a">{{ n.titulo }}</span>
+                  {% endif %}
+                </li>
+              {% endfor %}
+            </ul>
+          {% else %}
+            <div class="columns">
+              {% for n in noticias %}
+                <div class="item">
+                  {% if n.hora %}
+                    <span class="pub-time">{{ n.hora }}</span>
+                  {% endif %}
+                  <div class="headline">
+                    {% if n.link %}
+                      <a href="{{ n.link }}" target="_blank" rel="noopener">{{ n.titulo }}</a>
+                    {% else %}
+                      {{ n.titulo }}
+                    {% endif %}
+                  </div>
+
+                  {% if n.fonte %}
+                    <div class="byline">{{ n.fonte }}</div>
+                  {% endif %}
+
+                  {% if n.resumo %}
+                    <p class="teaser">{{ n.resumo }}</p>
+                  {% endif %}
+
+                  {% if n.link %}
+                    <a class="readmore" href="{{ n.link }}" target="_blank" rel="noopener">Ler completa</a>
                   {% endif %}
                 </div>
-
-                {% if n.fonte %}
-                  <div class="byline">{{ n.fonte }}</div>
-                {% endif %}
-
-                {% if n.resumo %}
-                  <p class="teaser">{{ n.resumo }}</p>
-                {% endif %}
-
-                {% if n.link %}
-                  <a class="readmore" href="{{ n.link }}" target="_blank" rel="noopener">Ler completa</a>
-                {% endif %}
-              </div>
-            {% endfor %}
-          </div>
+              {% endfor %}
+            </div>
+          {% endif %}
         {% else %}
           <p class="teaser">Sem notícias agora.</p>
         {% endif %}
@@ -535,7 +628,6 @@ HTML = r"""<!doctype html>
 </html>
 """
 
-
 # =========================================================
 # Rotas
 # =========================================================
@@ -545,19 +637,22 @@ def home():
 
     now = datetime.now(tz=TZ_BR)
     agora = now.strftime("%d/%m/%Y • %H:%M")
-    lua = fase_da_lua(now.replace(tzinfo=None))
+    lua = fase_da_lua(now)
     img = escolher_imagem_sem_repetir("Geral")
 
-    resp = app.make_response(render_template_string(
-        HTML,
-        temas=build_menu(),
-        active_slug="geral",
-        titulo_secao=titulo,
-        noticias=noticias,
-        agora=agora,
-        fase_lua=lua,
-        imagem=img,
-    ))
+    resp = app.make_response(
+        render_template_string(
+            HTML_TEMPLATE,
+            temas=build_menu(),
+            active_slug="geral",
+            titulo_secao=titulo,
+            noticias=noticias,
+            agora=agora,
+            fase_lua=lua,
+            imagem=img,
+            so_manchetes=False,
+        )
+    )
     resp.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=300"
     return resp
 
@@ -566,25 +661,35 @@ def home():
 def por_tema(slug: str):
     tema_label = TEMA_SLUGS.get(slug)
     if not tema_label:
-        return redirect(url_for("home"))
+        abort(404, description="Tema não encontrado")
 
-    titulo, noticias = get_section_cached(tema_label, limit=60)
+    if tema_label == "📰 Últimas":
+        limit = 100
+        so_manchetes = True
+    else:
+        limit = 60
+        so_manchetes = False
+
+    titulo, noticias = get_section_cached(tema_label, limit=limit)
 
     now = datetime.now(tz=TZ_BR)
     agora = now.strftime("%d/%m/%Y • %H:%M")
-    lua = fase_da_lua(now.replace(tzinfo=None))
+    lua = fase_da_lua(now)
     img = escolher_imagem_sem_repetir(tema_label)
 
-    resp = app.make_response(render_template_string(
-        HTML,
-        temas=build_menu(),
-        active_slug=slug,
-        titulo_secao=titulo,
-        noticias=noticias,
-        agora=agora,
-        fase_lua=lua,
-        imagem=img,
-    ))
+    resp = app.make_response(
+        render_template_string(
+            HTML_TEMPLATE,
+            temas=build_menu(),
+            active_slug=slug,
+            titulo_secao=titulo,
+            noticias=noticias,
+            agora=agora,
+            fase_lua=lua,
+            imagem=img,
+            so_manchetes=so_manchetes,
+        )
+    )
     resp.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=300"
     return resp
 
@@ -605,6 +710,10 @@ def health():
     return {"status": "ok"}
 
 
+# =========================================================
+# Inicialização
+# =========================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5001"))
+    threading.Thread(target=refresh_cache_background, daemon=True).start()
     app.run(host="0.0.0.0", port=port)
