@@ -218,4 +218,4 @@ def coletar_noticias_por_tema(limites: Dict[str, int] | None = None):
         buckets[tema] = itens
         flat.extend(itens)
 
-    return buckets, flat
+    return buckets, flat# alteração direta git teste
