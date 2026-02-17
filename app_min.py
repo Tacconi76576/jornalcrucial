@@ -12,13 +12,44 @@ import threading
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
-from flask import Flask, redirect, render_template_string, session, url_for
+from flask import Flask, redirect, render_template_string, request, session, url_for
 
 from jornal2 import FEEDS_BY_TEMA, LIMITES_PADRAO, coletar_noticias_por_tema
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "jornal-crucial-chave-local-1234567890")
+
+# =========================================================
+# Compressão gzip + headers de performance
+# =========================================================
+import gzip as _gzip
+import io as _io
+
+
+@app.after_request
+def compress_response(response):
+    # Só comprime text/* e application/json, só se cliente aceitar gzip
+    accept = request.headers.get("Accept-Encoding", "")
+    if "gzip" not in accept:
+        return response
+    ct = response.content_type or ""
+    if not any(t in ct for t in ("text/", "application/json", "application/javascript")):
+        return response
+    if response.direct_passthrough:
+        return response
+    data = response.get_data()
+    if len(data) < 500:  # não vale comprimir payloads pequenos
+        return response
+    buf = _io.BytesIO()
+    with _gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=6) as gz:
+        gz.write(data)
+    response.set_data(buf.getvalue())
+    response.headers["Content-Encoding"] = "gzip"
+    response.headers["Content-Length"] = len(response.get_data())
+    response.headers["Vary"] = "Accept-Encoding"
+    return response
 
 # =========================================================
 # Sanitização rápida
@@ -36,6 +67,8 @@ BLACKLIST = (
     "Participe do canal", "Receba as notícias", "The post", "appeared first on",
     "Leia a íntegra", "Leia a nota", "Assista", "AO VIVO",
 )
+
+TZ_BR = ZoneInfo("America/Sao_Paulo")
 
 
 def strip_html(text: Any) -> str:
@@ -85,6 +118,34 @@ def entry_ts(e: Any) -> float:
         return 0.0
 
 
+# =========================================================
+# NOVO: formata hora da notícia no fuso de Brasília
+# =========================================================
+def formatar_hora_noticia(entry: Any) -> str:
+    """
+    Lê published_parsed (struct_time UTC do feedparser) e converte para
+    horário de Brasília. Retorna "HH:MM" se for hoje, "DD/MM HH:MM" se for
+    outro dia, ou "" se não houver dado.
+
+    IMPORTANTE: usa calendar.timegm() (não time.mktime()) porque o feedparser
+    devolve published_parsed em UTC — time.mktime() interpretaria como hora
+    local do servidor e causaria adiantamento de 3h no Render (servidor em UTC).
+    """
+    try:
+        import calendar
+        t = entry.get("published_parsed") or entry.get("updated_parsed")
+        if not t:
+            return ""
+        ts = calendar.timegm(t)  # struct_time UTC → timestamp correto
+        dt_local = datetime.fromtimestamp(ts, tz=TZ_BR)
+        agora_local = datetime.now(tz=TZ_BR)
+        if dt_local.date() == agora_local.date():
+            return dt_local.strftime("%H:%M")
+        return dt_local.strftime("%d/%m %H:%M")
+    except Exception:
+        return ""
+
+
 def normalize_entry(entry: Any) -> Dict[str, Any]:
     titulo_raw = _get(entry, "title", "titulo", "headline", default="(sem título)")
     link = _get(entry, "link", "url", "href", default="") or ""
@@ -97,6 +158,7 @@ def normalize_entry(entry: Any) -> Dict[str, Any]:
         "fonte": strip_html(fonte),
         "resumo": summarize(resumo_raw, 320),
         "ts": float(entry_ts(entry)),
+        "hora": formatar_hora_noticia(entry),  # ← NOVO campo
     }
 
 
@@ -220,11 +282,9 @@ def fase_da_lua(dt: datetime) -> str:
 
 
 # =========================================================
-# Cache em JSON (PASSO 1)
-# - Serve cache rápido
-# - Se estiver velho, dispara refresh em background
+# Cache em JSON
 # =========================================================
-CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))  # 5 min padrão (ajuste se quiser)
+CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))
 
 BASE_DIR = os.path.dirname(__file__)
 CACHE_DIR = os.path.join(BASE_DIR, "cache")
@@ -273,7 +333,6 @@ def _cache_age_seconds(updated_at: Optional[str]) -> float:
 
 
 def _build_cache_from_feeds() -> Dict[str, Any]:
-    # Busca de verdade (lenta) — só aqui.
     buckets_raw, _flat = coletar_noticias_por_tema(LIMITES_PADRAO)
 
     buckets_norm: Dict[str, List[Dict[str, Any]]] = {}
@@ -283,7 +342,7 @@ def _build_cache_from_feeds() -> Dict[str, Any]:
         except Exception:
             entries = []
         entries.sort(key=entry_ts, reverse=True)
-        buckets_norm[tema] = normalize_list(entries, limit=120)  # guarda mais, corta na seção depois
+        buckets_norm[tema] = normalize_list(entries, limit=120)
 
     return {
         "updated_at": _now_iso(),
@@ -299,7 +358,6 @@ def refresh_cache_sync() -> None:
 
 def refresh_cache_background() -> None:
     global _REFRESHING
-    # Evita spawnar várias threads ao mesmo tempo
     if not _REFRESH_LOCK.acquire(blocking=False):
         return
     try:
@@ -315,21 +373,18 @@ def refresh_cache_background() -> None:
 
 
 def get_buckets_cached() -> Tuple[Dict[str, List[Dict[str, Any]]], Optional[str]]:
-    # Lê do disco (rápido)
     with _CACHE_LOCK:
         data = _read_cache_file()
 
     updated_at = data.get("updated_at")
     buckets = data.get("buckets") or {}
 
-    # Se não existe cache ainda: faz 1ª carga síncrona
     if not updated_at or not buckets:
         refresh_cache_sync()
         with _CACHE_LOCK:
             data = _read_cache_file()
         return (data.get("buckets") or {}), data.get("updated_at")
 
-    # Se estiver velho: dispara refresh em background e devolve o cache antigo (rápido pro mobile)
     if _cache_age_seconds(updated_at) > CACHE_TTL:
         threading.Thread(target=refresh_cache_background, daemon=True).start()
 
@@ -340,17 +395,14 @@ def get_section_cached(tema_label: Optional[str], limit: int) -> Tuple[str, List
     buckets, _updated_at = get_buckets_cached()
 
     if not tema_label:
-        # Geral
         if GERAL_LABEL and GERAL_LABEL in buckets and buckets.get(GERAL_LABEL):
             entries = list(buckets.get(GERAL_LABEL, []) or [])
         else:
             entries = []
-            # pega o primeiro tema com notícias
             for k in TEMAS:
                 entries = list(buckets.get(k, []) or [])
                 if entries:
                     break
-        # entries já vêm ordenados, mas garantimos
         entries.sort(key=lambda x: float(x.get("ts", 0.0)), reverse=True)
         titulo = "📰 Geral"
         noticias = entries[:limit]
@@ -360,7 +412,7 @@ def get_section_cached(tema_label: Optional[str], limit: int) -> Tuple[str, List
         titulo = display_label(tema_label)
         noticias = entries[:limit]
 
-    # remove campo ts antes do template (opcional)
+    # NÃO remove mais o campo 'ts' — só remove se quiser; 'hora' precisa ficar
     for n in noticias:
         n.pop("ts", None)
 
@@ -368,18 +420,20 @@ def get_section_cached(tema_label: Optional[str], limit: int) -> Tuple[str, List
 
 
 # =========================================================
-# HTML (seu template)
+# HTML
 # =========================================================
 HTML = r"""<!doctype html>
 <html lang="pt-br">
 <head>
   <meta charset="utf-8"/>
-  <meta http-equiv="refresh" content="300">
+  <link rel="dns-prefetch" href="//fonts.googleapis.com">
+  <link rel="dns-prefetch" href="//fonts.gstatic.com">
+  <meta http-equiv="refresh" content="600">
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>Jornal Crucial</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=IM+Fell+English:ital@0;1&family=Libre+Baskerville:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=IM+Fell+English:ital@0;1&family=Libre+Baskerville:wght@400;700&display=swap" onload="this.onload=null;this.rel='stylesheet'">
+  <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IM+Fell+English:ital@0;1&family=Libre+Baskerville:wght@400;700&display=swap"></noscript>
   <style>
     :root{ --paper:#f4f0e4; --ink:#1e1b16; --muted:#5a5146; --rule:#2b241b33; --shadow: 0 10px 30px rgba(0,0,0,.08); }
     body{ margin:0; color:var(--ink); background: radial-gradient(1200px 500px at 50% -100px, rgba(0,0,0,.06), transparent 60%), linear-gradient(180deg, #efe7d4 0%, var(--paper) 40%, #efe7d4 100%); font-family:"Libre Baskerville", serif; }
@@ -399,9 +453,10 @@ HTML = r"""<!doctype html>
     .section h2{ margin:0 0 10px 0; font-size:16px; letter-spacing:.04em; text-transform:uppercase; border-bottom:1px solid var(--rule); padding-bottom:8px; }
     .hero{ margin:12px 0 14px; border-radius:14px; overflow:hidden; border:1px solid rgba(0,0,0,.18); box-shadow:0 10px 18px rgba(0,0,0,.06); background:rgba(255,255,255,.25); }
     .hero img{ width:100%; display:block; max-height:260px; object-fit:cover; filter:saturate(.95) contrast(.98); }
-    .columns{ column-count:3; column-gap:22px; } @media (max-width:980px){ .columns{ column-count:2; } } @media (max-width:740px){ .columns{ column-count:1; } }
+    .columns{ column-count:3; column-gap:22px; } @media (max-width:980px){ .columns{ column-count:2; } } @media (max-width:740px){ .columns{ column-count:1; } } @media (max-width:600px){ .wrap{margin:8px auto 32px;padding:10px;} .paper{padding:12px 12px 16px;border-radius:12px;} .masthead h1{font-size:28px;} .masthead .kicker{font-size:10px;} .btn{padding:7px 10px;font-size:12px;} .menu{gap:7px;padding:10px 6px 2px;} .section{padding:10px 10px 14px;} .headline{font-size:14px;} .teaser{font-size:12px;} }
     .item{ break-inside:avoid; margin:0 0 14px 0; padding-bottom:12px; border-bottom:1px dashed var(--rule); overflow-wrap:anywhere; word-break:break-word; }
     .item:last-child{ border-bottom:none; padding-bottom:0; margin-bottom:0; }
+    .pub-time{ display:inline-block; font-size:13px; font-family:"IM Fell English", serif; font-style:italic; color:var(--muted); letter-spacing:.04em; margin-bottom:5px; }
     .headline{ font-size:15px; font-weight:700; line-height:1.25; margin:0 0 6px 0; }
     .headline a{ color:inherit; text-decoration:none; border-bottom:none; } .headline a:hover{ text-decoration:none; border-bottom:none; }
     .byline{ font-size:12px; color:var(--muted); margin:0 0 8px 0; font-family:"IM Fell English", serif; }
@@ -437,7 +492,7 @@ HTML = r"""<!doctype html>
 
         {% if imagem %}
           <div class="hero">
-            <img src="{{ url_for('static', filename=imagem) }}" alt="Imagem do tema"/>
+            <img src="{{ url_for('static', filename=imagem) }}" alt="Imagem do tema" loading="lazy" decoding="async"/>
           </div>
         {% endif %}
 
@@ -445,6 +500,9 @@ HTML = r"""<!doctype html>
           <div class="columns">
             {% for n in noticias %}
               <div class="item">
+                {% if n.hora %}
+                  <span class="pub-time">{{ n.hora }}</span>
+                {% endif %}
                 <div class="headline">
                   {% if n.link %}
                     <a href="{{ n.link }}" target="_blank" rel="noopener">{{ n.titulo }}</a>
@@ -483,14 +541,14 @@ HTML = r"""<!doctype html>
 # =========================================================
 @app.get("/")
 def home():
-    titulo, noticias = get_section_cached(None, limit=80)
+    titulo, noticias = get_section_cached(None, limit=40)
 
-    now = datetime.now()
+    now = datetime.now(tz=TZ_BR)
     agora = now.strftime("%d/%m/%Y • %H:%M")
-    lua = fase_da_lua(now)
+    lua = fase_da_lua(now.replace(tzinfo=None))
     img = escolher_imagem_sem_repetir("Geral")
 
-    return render_template_string(
+    resp = app.make_response(render_template_string(
         HTML,
         temas=build_menu(),
         active_slug="geral",
@@ -499,7 +557,9 @@ def home():
         agora=agora,
         fase_lua=lua,
         imagem=img,
-    )
+    ))
+    resp.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=300"
+    return resp
 
 
 @app.get("/tema/<slug>")
@@ -510,12 +570,12 @@ def por_tema(slug: str):
 
     titulo, noticias = get_section_cached(tema_label, limit=60)
 
-    now = datetime.now()
+    now = datetime.now(tz=TZ_BR)
     agora = now.strftime("%d/%m/%Y • %H:%M")
-    lua = fase_da_lua(now)
+    lua = fase_da_lua(now.replace(tzinfo=None))
     img = escolher_imagem_sem_repetir(tema_label)
 
-    return render_template_string(
+    resp = app.make_response(render_template_string(
         HTML,
         temas=build_menu(),
         active_slug=slug,
@@ -524,12 +584,13 @@ def por_tema(slug: str):
         agora=agora,
         fase_lua=lua,
         imagem=img,
-    )
+    ))
+    resp.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=300"
+    return resp
 
 
 @app.get("/refresh")
 def refresh():
-    # Força refresh manual (útil pra testar no deploy)
     refresh_cache_sync()
     return {"ok": True, "updated_at": _now_iso()}
 

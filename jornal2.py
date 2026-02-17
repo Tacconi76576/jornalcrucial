@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Tuple
+from zoneinfo import ZoneInfo
 
 import feedparser
 import requests
@@ -14,6 +16,7 @@ import requests
 # =========================================================
 DEFAULT_TIMEOUT = int(__import__("os").environ.get("JC_TIMEOUT", "8"))
 CACHE_TTL = int(__import__("os").environ.get("JC_CACHE_TTL", "180"))  # 3 min
+TIMEZONE = __import__("os").environ.get("JC_TIMEZONE", "America/Sao_Paulo")
 
 DEFAULT_HEADERS = {
     "User-Agent": "JornalCrucial/1.0 (+https://jornal-j5jf.onrender.com)",
@@ -109,9 +112,42 @@ LIMITES_PADRAO: Dict[str, int] = {
 
 
 # =========================================================
-# Helpers
+# Helpers de tempo
 # =========================================================
+def _tz() -> ZoneInfo:
+    """Retorna o fuso horário configurado, com fallback para UTC."""
+    try:
+        return ZoneInfo(TIMEZONE)
+    except Exception:
+        return ZoneInfo("UTC")
+
+
+def agora_local() -> datetime:
+    """Retorna o datetime atual no fuso horário local configurado."""
+    return datetime.now(tz=_tz())
+
+
+def formatar_hora_cabecalho() -> str:
+    """
+    Retorna string formatada para o cabeçalho do jornal.
+    Ex.: 'Terça-feira, 17 de fevereiro de 2025 — 14:32'
+    """
+    DIAS_PT = [
+        "Segunda-feira", "Terça-feira", "Quarta-feira",
+        "Quinta-feira", "Sexta-feira", "Sábado", "Domingo",
+    ]
+    MESES_PT = [
+        "", "janeiro", "fevereiro", "março", "abril", "maio", "junho",
+        "julho", "agosto", "setembro", "outubro", "novembro", "dezembro",
+    ]
+    agora = agora_local()
+    dia_semana = DIAS_PT[agora.weekday()]
+    mes = MESES_PT[agora.month]
+    return f"{dia_semana}, {agora.day} de {mes} de {agora.year} — {agora.strftime('%H:%M')}"
+
+
 def entry_ts(e: Any) -> float:
+    """Retorna o timestamp Unix da entrada RSS."""
     try:
         t = e.get("published_parsed") or e.get("updated_parsed")
     except Exception:
@@ -122,6 +158,33 @@ def entry_ts(e: Any) -> float:
         return 0.0
 
 
+def formatar_hora_noticia(e: Any) -> str:
+    """
+    Retorna a hora de publicação da notícia formatada como 'HH:MM'
+    no fuso horário local. Retorna '' se não disponível.
+    """
+    try:
+        t = e.get("published_parsed") or e.get("updated_parsed")
+        if not t:
+            return ""
+        # time.struct_time do feedparser é em UTC
+        ts = time.mktime(t)
+        dt_utc = datetime.fromtimestamp(ts, tz=ZoneInfo("UTC"))
+        dt_local = dt_utc.astimezone(_tz())
+
+        agora = agora_local()
+        # Se for hoje, mostra só a hora; se for outro dia, mostra "DD/MM HH:MM"
+        if dt_local.date() == agora.date():
+            return dt_local.strftime("%H:%M")
+        else:
+            return dt_local.strftime("%d/%m %H:%M")
+    except Exception:
+        return ""
+
+
+# =========================================================
+# Coleta
+# =========================================================
 def _coletar_de_feeds(urls: List[str], limite_total: int | None = None) -> List[Dict[str, Any]]:
     itens: List[Dict[str, Any]] = []
     vistos: set[str] = set()
