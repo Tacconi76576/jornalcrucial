@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Flask, redirect, render_template_string, session, url_for
 
-from .jornal2 import FEEDS_BY_TEMA, LIMITES_PADRAO, coletar_noticias_por_tema
+from jornal2 import FEEDS_BY_TEMA, LIMITES_PADRAO, coletar_noticias_por_tema
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "jornal-crucial-chave-local-1234567890")
