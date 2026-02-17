@@ -1,12 +1,14 @@
 # app_min.py — Jornal Crucial (somente jornal)
-# Cache forte (buckets + seção normalizada) para Render ficar rápido.
+# Cache forte (JSON em disco + atualização em background) para Render ficar rápido.
 
 from __future__ import annotations
 
 import html as _html
+import json
 import os
 import random
 import re
+import threading
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -72,7 +74,18 @@ def _get(entry: Any, *keys: str, default: str = "") -> Any:
     return default
 
 
-def normalize_entry(entry: Any) -> Dict[str, str]:
+def entry_ts(e: Any) -> float:
+    try:
+        t = e.get("published_parsed") or e.get("updated_parsed")
+    except Exception:
+        t = None
+    try:
+        return time.mktime(t) if t else 0.0
+    except Exception:
+        return 0.0
+
+
+def normalize_entry(entry: Any) -> Dict[str, Any]:
     titulo_raw = _get(entry, "title", "titulo", "headline", default="(sem título)")
     link = _get(entry, "link", "url", "href", default="") or ""
     fonte = _get(entry, "source", "fonte", "publisher", "site", default="") or ""
@@ -83,12 +96,13 @@ def normalize_entry(entry: Any) -> Dict[str, str]:
         "link": str(link),
         "fonte": strip_html(fonte),
         "resumo": summarize(resumo_raw, 320),
+        "ts": float(entry_ts(entry)),
     }
 
 
-def normalize_list(entries: List[Any], limit: int) -> List[Dict[str, str]]:
+def normalize_list(entries: List[Any], limit: int) -> List[Dict[str, Any]]:
     seen: set[Tuple[str, str]] = set()
-    out: List[Dict[str, str]] = []
+    out: List[Dict[str, Any]] = []
     for e in entries:
         n = normalize_entry(e)
         key = (n.get("titulo", ""), n.get("link", ""))
@@ -205,69 +219,151 @@ def fase_da_lua(dt: datetime) -> str:
     return "🌑 Lua Nova"
 
 
-def entry_ts(e: Any) -> float:
-    try:
-        t = e.get("published_parsed") or e.get("updated_parsed")
-    except Exception:
-        t = None
-    try:
-        return time.mktime(t) if t else 0.0
-    except Exception:
-        return 0.0
-
-
 # =========================================================
-# Cache (buckets + seção normalizada)
+# Cache em JSON (PASSO 1)
+# - Serve cache rápido
+# - Se estiver velho, dispara refresh em background
 # =========================================================
-CACHE_TTL = int(os.getenv("CACHE_TTL", "180"))
+CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))  # 5 min padrão (ajuste se quiser)
 
-_CACHE: Dict[str, Any] = {
-    "ts": 0.0,
-    "buckets": None,
-    "sections": {},  # key -> (ts, titulo, noticias_normalizadas)
-}
+BASE_DIR = os.path.dirname(__file__)
+CACHE_DIR = os.path.join(BASE_DIR, "cache")
+CACHE_FILE = os.path.join(CACHE_DIR, "feeds_cache.json")
 
-
-def _expired(ts: float) -> bool:
-    return (time.time() - ts) > CACHE_TTL
+_CACHE_LOCK = threading.Lock()
+_REFRESH_LOCK = threading.Lock()
+_REFRESHING = False
 
 
-def get_buckets_cached():
-    if _CACHE["buckets"] is None or _expired(_CACHE["ts"]):
-        buckets, _flat = coletar_noticias_por_tema(LIMITES_PADRAO)
-        _CACHE["buckets"] = buckets
-        _CACHE["ts"] = time.time()
-        _CACHE["sections"] = {}  # invalida seções
-    return _CACHE["buckets"]
+def _ensure_cache_dir():
+    os.makedirs(CACHE_DIR, exist_ok=True)
 
 
-def get_section_cached(tema_label: Optional[str], limit: int):
-    key = f"{tema_label or '__GERAL__'}::{limit}"
-    cached = _CACHE["sections"].get(key)
-    if cached and not _expired(cached[0]):
-        return cached[1], cached[2]
+def _now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
 
-    buckets = get_buckets_cached()
+
+def _read_cache_file() -> Dict[str, Any]:
+    _ensure_cache_dir()
+    if not os.path.exists(CACHE_FILE):
+        return {"updated_at": None, "buckets": {}}
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"updated_at": None, "buckets": {}}
+
+
+def _write_cache_file(data: Dict[str, Any]) -> None:
+    _ensure_cache_dir()
+    tmp = CACHE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, CACHE_FILE)
+
+
+def _cache_age_seconds(updated_at: Optional[str]) -> float:
+    if not updated_at:
+        return 1e18
+    try:
+        last = datetime.fromisoformat(updated_at)
+        return (datetime.now() - last).total_seconds()
+    except Exception:
+        return 1e18
+
+
+def _build_cache_from_feeds() -> Dict[str, Any]:
+    # Busca de verdade (lenta) — só aqui.
+    buckets_raw, _flat = coletar_noticias_por_tema(LIMITES_PADRAO)
+
+    buckets_norm: Dict[str, List[Dict[str, Any]]] = {}
+    for tema, entries in (buckets_raw or {}).items():
+        try:
+            entries = list(entries or [])
+        except Exception:
+            entries = []
+        entries.sort(key=entry_ts, reverse=True)
+        buckets_norm[tema] = normalize_list(entries, limit=120)  # guarda mais, corta na seção depois
+
+    return {
+        "updated_at": _now_iso(),
+        "buckets": buckets_norm,
+    }
+
+
+def refresh_cache_sync() -> None:
+    data = _build_cache_from_feeds()
+    with _CACHE_LOCK:
+        _write_cache_file(data)
+
+
+def refresh_cache_background() -> None:
+    global _REFRESHING
+    # Evita spawnar várias threads ao mesmo tempo
+    if not _REFRESH_LOCK.acquire(blocking=False):
+        return
+    try:
+        if _REFRESHING:
+            return
+        _REFRESHING = True
+        try:
+            refresh_cache_sync()
+        finally:
+            _REFRESHING = False
+    finally:
+        _REFRESH_LOCK.release()
+
+
+def get_buckets_cached() -> Tuple[Dict[str, List[Dict[str, Any]]], Optional[str]]:
+    # Lê do disco (rápido)
+    with _CACHE_LOCK:
+        data = _read_cache_file()
+
+    updated_at = data.get("updated_at")
+    buckets = data.get("buckets") or {}
+
+    # Se não existe cache ainda: faz 1ª carga síncrona
+    if not updated_at or not buckets:
+        refresh_cache_sync()
+        with _CACHE_LOCK:
+            data = _read_cache_file()
+        return (data.get("buckets") or {}), data.get("updated_at")
+
+    # Se estiver velho: dispara refresh em background e devolve o cache antigo (rápido pro mobile)
+    if _cache_age_seconds(updated_at) > CACHE_TTL:
+        threading.Thread(target=refresh_cache_background, daemon=True).start()
+
+    return buckets, updated_at
+
+
+def get_section_cached(tema_label: Optional[str], limit: int) -> Tuple[str, List[Dict[str, Any]]]:
+    buckets, _updated_at = get_buckets_cached()
 
     if not tema_label:
-        if GERAL_LABEL and GERAL_LABEL in buckets:
+        # Geral
+        if GERAL_LABEL and GERAL_LABEL in buckets and buckets.get(GERAL_LABEL):
             entries = list(buckets.get(GERAL_LABEL, []) or [])
         else:
             entries = []
+            # pega o primeiro tema com notícias
             for k in TEMAS:
                 entries = list(buckets.get(k, []) or [])
                 if entries:
                     break
-        entries.sort(key=entry_ts, reverse=True)
+        # entries já vêm ordenados, mas garantimos
+        entries.sort(key=lambda x: float(x.get("ts", 0.0)), reverse=True)
         titulo = "📰 Geral"
-        noticias = normalize_list(entries, limit=limit)
+        noticias = entries[:limit]
     else:
         entries = list(buckets.get(tema_label, []) or [])
-        entries.sort(key=entry_ts, reverse=True)
+        entries.sort(key=lambda x: float(x.get("ts", 0.0)), reverse=True)
         titulo = display_label(tema_label)
-        noticias = normalize_list(entries, limit=limit)
+        noticias = entries[:limit]
 
-    _CACHE["sections"][key] = (time.time(), titulo, noticias)
+    # remove campo ts antes do template (opcional)
+    for n in noticias:
+        n.pop("ts", None)
+
     return titulo, noticias
 
 
@@ -429,6 +525,13 @@ def por_tema(slug: str):
         fase_lua=lua,
         imagem=img,
     )
+
+
+@app.get("/refresh")
+def refresh():
+    # Força refresh manual (útil pra testar no deploy)
+    refresh_cache_sync()
+    return {"ok": True, "updated_at": _now_iso()}
 
 
 @app.get("/favicon.ico")
