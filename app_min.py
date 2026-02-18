@@ -7,11 +7,14 @@
 # - Tema "📰 Últimas": 100 itens, lista 1 coluna, com HORÁRIO antes da manchete (igual aos outros temas)
 # - Outros temas continuam no layout normal (com hora + título + fonte + resumo)
 # - Sem "Geopolítica" em nenhum lugar: fica somente "🌍 Economia"
+# - ✅ Correção de RESUMO para ECONOMIA (e outros): extrai texto de Atom/RSS (summary/description/content[].value)
 
 from __future__ import annotations
 
 import calendar
+import gzip as _gzip
 import html as _html
+import io as _io
 import json
 import logging
 import os
@@ -49,10 +52,6 @@ TZ_BR = ZoneInfo("America/Sao_Paulo")
 # =========================================================
 # Compressão gzip + headers de performance
 # =========================================================
-import gzip as _gzip
-import io as _io
-
-
 @app.after_request
 def compress_response(response):
     """Comprime respostas textuais se o cliente aceitar gzip e o payload for grande."""
@@ -142,6 +141,122 @@ def _get(entry: Any, *keys: str, default: str = "") -> Any:
     return default
 
 
+def _as_text(v: Any) -> str:
+    """
+    Converte valores comuns do feedparser em texto:
+    - dict com 'value'
+    - list de dicts com 'value'
+    - qualquer coisa -> str
+    """
+    if v is None:
+        return ""
+    try:
+        # feedparser: summary_detail = {'type': 'text/html', 'value': '...'}
+        if isinstance(v, dict):
+            if "value" in v and v["value"]:
+                return str(v["value"])
+            # às vezes vem como {'content': '...'} ou similares
+            for k in ("content", "summary", "description", "text"):
+                if k in v and v[k]:
+                    return str(v[k])
+            return str(v)
+
+        # feedparser: content = [{'type': 'text/html', 'value': '...'}]
+        if isinstance(v, list) and v:
+            # pega o primeiro item que tenha algo utilizável
+            for item in v:
+                s = _as_text(item)
+                if s:
+                    return s
+            return ""
+
+        return str(v)
+    except Exception:
+        return ""
+
+
+def extrair_resumo(entry: Any) -> str:
+    """
+    Tenta achar o melhor texto-resumo possível, cobrindo variações comuns de RSS/Atom.
+    """
+    # ordem importa: o primeiro que vier "bom" ganha
+    candidatos = [
+        entry.get("summary"),
+        entry.get("summary_detail"),  # -> dict{'value': ...}
+        entry.get("description"),
+        entry.get("subtitle"),
+        entry.get("content"),  # -> list[dict{'value': ...}]
+        entry.get("content_detail"),
+    ]
+    for c in candidatos:
+        txt = strip_html(_as_text(c))
+        if txt:
+            return txt
+    return ""
+
+
+# =========================================================
+# ✅ Extração robusta de RESUMO e FONTE (resolve Economia)
+# =========================================================
+def _entry_text(entry: Any) -> str:
+    """
+    Extrai texto de resumo de feeds RSS/Atom variados:
+    - summary / summary_detail.value
+    - description
+    - content[0].value (Atom/Blogger comum)
+    - subtitle
+    """
+    # summary direto
+    s = _get(entry, "summary", default="")
+    if s:
+        return str(s)
+
+    # summary_detail
+    try:
+        sd = entry.get("summary_detail") or {}
+        v = sd.get("value") or ""
+        if v:
+            return str(v)
+    except Exception:
+        pass
+
+    # description
+    d = _get(entry, "description", default="")
+    if d:
+        return str(d)
+
+    # content (Atom): lista de dicts com "value"
+    try:
+        c = entry.get("content")
+        if isinstance(c, list) and c:
+            v = (c[0] or {}).get("value") or ""
+            if v:
+                return str(v)
+        if isinstance(c, dict):
+            v = c.get("value") or ""
+            if v:
+                return str(v)
+    except Exception:
+        pass
+
+    # subtitle (alguns Atom)
+    sub = _get(entry, "subtitle", default="")
+    if sub:
+        return str(sub)
+
+    return ""
+
+
+def _entry_source(entry: Any) -> str:
+    """
+    Alguns feeds trazem source como dict: {"title": "..."}.
+    """
+    src = _get(entry, "source", "fonte", "publisher", "site", default="")
+    if isinstance(src, dict):
+        return str(src.get("title") or src.get("name") or "")
+    return str(src or "")
+
+
 # =========================================================
 # Horários (CORRIGIDO: struct_time do feedparser é UTC)
 # =========================================================
@@ -182,8 +297,10 @@ def formatar_hora_noticia(entry: Any) -> str:
 def normalize_entry(entry: Any) -> Dict[str, Any]:
     titulo_raw = _get(entry, "title", "titulo", "headline", default="(sem título)")
     link = _get(entry, "link", "url", "href", default="") or ""
-    fonte = _get(entry, "source", "fonte", "publisher", "site", default="") or ""
-    resumo_raw = _get(entry, "summary", "description", "content", "resumo", default="")
+    fonte = _entry_source(entry)
+
+    # ✅ resumo correto (Economia / Atom / Blogger / Investing / BCB etc.)
+    resumo_raw = _entry_text(entry)
 
     return {
         "titulo": summarize(titulo_raw, 140) or "(sem título)",
