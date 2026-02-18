@@ -3,11 +3,14 @@
 # Cache forte (JSON em disco + atualização em background) para Render ficar rápido.
 #
 # ✅ Nesta versão:
-# - Corrige horário "no futuro" (usa calendar.timegm para struct_time UTC do feedparser)
-# - Tema "📰 Últimas": 100 itens, lista 1 coluna, com HORÁRIO antes da manchete (igual aos outros temas)
-# - Outros temas continuam no layout normal (com hora + título + fonte + resumo)
-# - Sem "Geopolítica" em nenhum lugar: fica somente "🌍 Economia"
-# - ✅ Correção de RESUMO para ECONOMIA (e outros): extrai texto de Atom/RSS (summary/description/content[].value)
+# - Corrige horário "no futuro" APENAS no tema ⚽ Esporte (heurística UTC vs local)
+# - Tema "📰 Últimas": 100 itens, lista 1 coluna, com HORÁRIO antes da manchete
+# - Outros temas: layout normal (hora + título + fonte + resumo)
+# - Sem "Geopolítica": fica somente "🌍 Economia"
+# - ✅ Resumo robusto (RSS/Atom): summary/description/content[].value etc.
+#
+# Obs: Este arquivo usa os feeds e coleta do jornal2.py, mas normaliza e
+# formata hora aqui (normalize_entry), então o ajuste do "futuro" é aqui.
 
 from __future__ import annotations
 
@@ -21,17 +24,12 @@ import os
 import random
 import re
 import threading
+import time  # ✅ necessário para heurística do esporte
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-from flask import (
-    Flask,
-    abort,
-    render_template_string,
-    request,
-    session,
-)
+from flask import Flask, abort, render_template_string, request, session
 
 from jornal2 import FEEDS_BY_TEMA, LIMITES_PADRAO, coletar_noticias_por_tema
 
@@ -151,19 +149,15 @@ def _as_text(v: Any) -> str:
     if v is None:
         return ""
     try:
-        # feedparser: summary_detail = {'type': 'text/html', 'value': '...'}
         if isinstance(v, dict):
             if "value" in v and v["value"]:
                 return str(v["value"])
-            # às vezes vem como {'content': '...'} ou similares
             for k in ("content", "summary", "description", "text"):
                 if k in v and v[k]:
                     return str(v[k])
             return str(v)
 
-        # feedparser: content = [{'type': 'text/html', 'value': '...'}]
         if isinstance(v, list) and v:
-            # pega o primeiro item que tenha algo utilizável
             for item in v:
                 s = _as_text(item)
                 if s:
@@ -176,16 +170,13 @@ def _as_text(v: Any) -> str:
 
 
 def extrair_resumo(entry: Any) -> str:
-    """
-    Tenta achar o melhor texto-resumo possível, cobrindo variações comuns de RSS/Atom.
-    """
-    # ordem importa: o primeiro que vier "bom" ganha
+    """Tenta achar o melhor texto-resumo possível, cobrindo variações comuns de RSS/Atom."""
     candidatos = [
         entry.get("summary"),
-        entry.get("summary_detail"),  # -> dict{'value': ...}
+        entry.get("summary_detail"),
         entry.get("description"),
         entry.get("subtitle"),
-        entry.get("content"),  # -> list[dict{'value': ...}]
+        entry.get("content"),
         entry.get("content_detail"),
     ]
     for c in candidatos:
@@ -196,22 +187,14 @@ def extrair_resumo(entry: Any) -> str:
 
 
 # =========================================================
-# ✅ Extração robusta de RESUMO e FONTE (resolve Economia)
+# ✅ Extração robusta de RESUMO e FONTE
 # =========================================================
 def _entry_text(entry: Any) -> str:
-    """
-    Extrai texto de resumo de feeds RSS/Atom variados:
-    - summary / summary_detail.value
-    - description
-    - content[0].value (Atom/Blogger comum)
-    - subtitle
-    """
-    # summary direto
+    """Extrai texto de resumo de feeds RSS/Atom variados."""
     s = _get(entry, "summary", default="")
     if s:
         return str(s)
 
-    # summary_detail
     try:
         sd = entry.get("summary_detail") or {}
         v = sd.get("value") or ""
@@ -220,12 +203,10 @@ def _entry_text(entry: Any) -> str:
     except Exception:
         pass
 
-    # description
     d = _get(entry, "description", default="")
     if d:
         return str(d)
 
-    # content (Atom): lista de dicts com "value"
     try:
         c = entry.get("content")
         if isinstance(c, list) and c:
@@ -239,7 +220,6 @@ def _entry_text(entry: Any) -> str:
     except Exception:
         pass
 
-    # subtitle (alguns Atom)
     sub = _get(entry, "subtitle", default="")
     if sub:
         return str(sub)
@@ -248,9 +228,7 @@ def _entry_text(entry: Any) -> str:
 
 
 def _entry_source(entry: Any) -> str:
-    """
-    Alguns feeds trazem source como dict: {"title": "..."}.
-    """
+    """Alguns feeds trazem source como dict: {'title': '...'}."""
     src = _get(entry, "source", "fonte", "publisher", "site", default="")
     if isinstance(src, dict):
         return str(src.get("title") or src.get("name") or "")
@@ -258,30 +236,63 @@ def _entry_source(entry: Any) -> str:
 
 
 # =========================================================
-# Horários (CORRIGIDO: struct_time do feedparser é UTC)
+# Horários
 # =========================================================
-def entry_ts(e: Any) -> float:
-    """Timestamp correto: usa calendar.timegm (UTC)."""
+def _entry_struct(entry: Any):
     try:
-        t = e.get("published_parsed") or e.get("updated_parsed")
+        return entry.get("published_parsed") or entry.get("updated_parsed")
     except Exception:
-        t = None
-    try:
-        return float(calendar.timegm(t)) if t else 0.0
-    except Exception:
+        return None
+
+
+def entry_ts(entry: Any, tema: Optional[str] = None) -> float:
+    """
+    Timestamp:
+    - Geral: assume struct_time em UTC (calendar.timegm)
+    - ⚽ Esporte: alguns feeds vêm ambíguos -> tenta UTC e local e escolhe o que não fica no futuro.
+    """
+    t = _entry_struct(entry)
+    if not t:
         return 0.0
 
+    # Interpretação 1: UTC (padrão)
+    try:
+        ts_utc = float(calendar.timegm(t))
+    except Exception:
+        ts_utc = 0.0
 
-def formatar_hora_noticia(entry: Any) -> str:
+    # Interpretação 2: local do sistema
+    try:
+        ts_local = float(time.mktime(t))
+    except Exception:
+        ts_local = 0.0
+
+    if tema != "⚽ Esporte":
+        return ts_utc
+
+    now = time.time()
+    candidates = [x for x in (ts_utc, ts_local) if x > 0]
+    if not candidates:
+        return 0.0
+
+    # preferir não-futuro (tolerância 5min)
+    not_future = [x for x in candidates if x <= now + 300]
+    pool = not_future if not_future else candidates
+
+    # escolhe o mais próximo do agora
+    return min(pool, key=lambda x: abs(x - now))
+
+
+def formatar_hora_noticia(entry: Any, tema: Optional[str] = None) -> str:
     """
-    Converte o horário UTC da notícia para o fuso de Brasília.
-    Retorna "HH:MM" se for hoje, "DD/MM HH:MM" caso contrário.
+    Converte o horário da notícia para o fuso de Brasília.
+    - ⚽ Esporte: usa entry_ts smart para evitar hora no futuro.
     """
     try:
-        t = entry.get("published_parsed") or entry.get("updated_parsed")
-        if not t:
+        ts = entry_ts(entry, tema=tema)
+        if not ts:
             return ""
-        ts = calendar.timegm(t)  # ✅ UTC correto
+
         dt_utc = datetime.fromtimestamp(ts, tz=ZoneInfo("UTC"))
         dt_local = dt_utc.astimezone(TZ_BR)
 
@@ -294,12 +305,14 @@ def formatar_hora_noticia(entry: Any) -> str:
         return ""
 
 
-def normalize_entry(entry: Any) -> Dict[str, Any]:
+# =========================================================
+# Normalização (usa tema para corrigir ⚽ Esporte)
+# =========================================================
+def normalize_entry(entry: Any, tema: Optional[str] = None) -> Dict[str, Any]:
     titulo_raw = _get(entry, "title", "titulo", "headline", default="(sem título)")
     link = _get(entry, "link", "url", "href", default="") or ""
     fonte = _entry_source(entry)
 
-    # ✅ resumo correto (Economia / Atom / Blogger / Investing / BCB etc.)
     resumo_raw = _entry_text(entry)
 
     return {
@@ -307,16 +320,16 @@ def normalize_entry(entry: Any) -> Dict[str, Any]:
         "link": str(link),
         "fonte": strip_html(fonte),
         "resumo": summarize(resumo_raw, 320),
-        "ts": float(entry_ts(entry)),
-        "hora": formatar_hora_noticia(entry),
+        "ts": float(entry_ts(entry, tema=tema)),
+        "hora": formatar_hora_noticia(entry, tema=tema),
     }
 
 
-def normalize_list(entries: List[Any], limit: int) -> List[Dict[str, Any]]:
+def normalize_list(entries: List[Any], limit: int, tema: Optional[str] = None) -> List[Dict[str, Any]]:
     seen: set[Tuple[str, str]] = set()
     out: List[Dict[str, Any]] = []
     for e in entries:
-        n = normalize_entry(e)
+        n = normalize_entry(e, tema=tema)
         key = (n.get("titulo", ""), n.get("link", ""))
         if key in seen:
             continue
@@ -338,7 +351,6 @@ def slugify_tema(tema: str) -> str:
 
 
 def display_label(tema: str) -> str:
-    """Rótulo exibido no menu/título (sem mapeamento de geopolítica)."""
     return tema
 
 
@@ -526,10 +538,11 @@ def _build_cache_from_feeds() -> Dict[str, Any]:
         except Exception:
             entries = []
 
-        entries.sort(key=entry_ts, reverse=True)
+        # ✅ ordena com ts "smart" no esporte
+        entries.sort(key=lambda e: entry_ts(e, tema=tema), reverse=True)
 
         keep = 140 if tema == "📰 Últimas" else 120
-        buckets_norm[tema] = normalize_list(entries, limit=keep)
+        buckets_norm[tema] = normalize_list(entries, limit=keep, tema=tema)
 
     logger.info("Cache construído com sucesso.")
     return {"updated_at": _now_iso(), "buckets": buckets_norm}
@@ -597,6 +610,7 @@ def get_section_cached(tema_label: Optional[str], limit: int) -> Tuple[str, List
         titulo = display_label(tema_label)
         noticias = entries[:limit]
 
+    # remove ts do payload enviado ao template
     for n in noticias:
         n.pop("ts", None)
 
